@@ -1,33 +1,55 @@
+require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
 const { MongoClient } = require('mongodb');
-const dotenv = require('dotenv');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const { OAuth2Client } = require('google-auth-library');
-require('dotenv').config();
+const axios = require('axios');
+const bodyParser = require('body-parser');
+const { param, query, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const winston = require('winston');
 
 // Configuration
 const GENAI_API_KEYS = [
-  process.env.GENAI_API_KEY1 ,
-  process.env.GENAI_API_KEY2 ,
+  process.env.GENAI_API_KEY1,
+  process.env.GENAI_API_KEY2,
   process.env.GENAI_API_KEY3,
   process.env.GENAI_API_KEY4,
   process.env.GENAI_API_KEY5,
   process.env.GENAI_API_KEY6,
   process.env.GENAI_API_KEY7,
+  process.env.GENAI_API_KEY8,
+  process.env.GENAI_API_KEY9,
+  process.env.GENAI_API_KEY10,
+  process.env.GENAI_API_KEY11,
+  process.env.GENAI_API_KEY12,
+  process.env.GENAI_API_KEY13,
+  process.env.GENAI_API_KEY14,
+  process.env.GENAI_API_KEY15,
+  process.env.GENAI_API_KEY16,
+  process.env.GENAI_API_KEY17,
+  process.env.GENAI_API_KEY18,
+  process.env.GENAI_API_KEY19,
+  process.env.GENAI_API_KEY20,
+  process.env.GENAI_API_KEY21,
+  process.env.GENAI_API_KEY22
 ];
 const BINANCE_WS_URL = process.env.BINANCE_WS_URL;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
 const DATA_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
-const MONGODB_URI = process.env.MONGODB_URI ;
+const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = 'marketData';
 const JWT_SECRET = process.env.JWT_SECRET;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 
 const TIMEFRAMES = ['1h', '3h', '6h', '12h', '24h'];
 const TIMEFRAME_MS = {
@@ -38,13 +60,61 @@ const TIMEFRAME_MS = {
   '24h': 24 * 60 * 60 * 1000
 };
 
+const PLAN_CURRENCIES = {
+  Free: ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'LTC/USDT', 'DOGE/USDT'], // Free tier: 5 currencies
+  Basic: ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'LTC/USDT', 'BCH/USDT', 'ADA/USDT', 'DOT/USDT', 'LINK/USDT', 'BNB/USDT', 'DOGE/USDT'],
+  Pro: ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'LTC/USDT', 'BCH/USDT', 'ADA/USDT', 'DOT/USDT', 'LINK/USDT', 'BNB/USDT', 'DOGE/USDT', 'SOL/USDT', 'MATIC/USDT', 'AVAX/USDT', 'ATOM/USDT', 'UNI/USDT'],
+  Enterprise: 'all' // All currencies
+};
+
+const FREE_TIER_ACCESS = {
+  timeframes: ['12h', '24h'],
+  endpoints: ['news', 'sentiment', 'all-impact-news','rate']
+};
+
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const isProduction = NODE_ENV === 'production';
+
+// Logger setup
+const logger = winston.createLogger({
+  level: isProduction ? 'warn' : 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.simple(),
+    }),
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ]
+});
+
 // Google OAuth2 client
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-// MongoDB client
+// MongoDB client (Singleton)
+let mongoInstance = null;
+
 class MongoDBClient {
+  static getInstance() {
+    if (!mongoInstance) {
+      mongoInstance = new MongoDBClient();
+      mongoInstance.connect();
+    }
+    return mongoInstance;
+  }
+
   constructor() {
-    this.client = new MongoClient(MONGODB_URI);
+    if (mongoInstance) throw new Error('Use getInstance()');
+    this.client = new MongoClient(MONGODB_URI, {
+       maxPoolSize: 10,
+       minPoolSize: 2,
+       maxIdleTimeMS: 30000,
+       serverSelectionTimeoutMS: 5000
+      });
     this.db = this.client.db(DB_NAME);
     this.newsCollection = this.db.collection('newsCache');
     this.sentimentCollection = this.db.collection('sentimentCache');
@@ -57,10 +127,10 @@ class MongoDBClient {
   async connect() {
     try {
       await this.client.connect();
-      console.log('Connected to MongoDB');
+      logger.info('Connected to MongoDB');
       await this.createIndexes();
     } catch (error) {
-      console.error('Failed to connect to MongoDB:', error);
+      logger.error('Failed to connect to MongoDB:', { error: error.message });
       throw error;
     }
   }
@@ -79,12 +149,12 @@ class MongoDBClient {
       for (const { collection, name } of collections) {
         try {
           await collection.dropIndex('symbol_1');
-          console.log(`Dropped old symbol_1 index from ${name}`);
+          logger.info(`Dropped old symbol_1 index from ${name}`);
         } catch (error) {
           if (error.message.includes('index not found')) {
-            console.log(`No symbol_1 index to drop in ${name}`);
+            logger.info(`No symbol_1 index to drop in ${name}`);
           } else {
-            console.error(`Error dropping symbol_1 index from ${name}:`, error);
+            logger.error(`Error dropping symbol_1 index from ${name}:`, { error: error.message });
           }
         }
       }
@@ -98,9 +168,9 @@ class MongoDBClient {
         this.usersCollection.createIndex({ email: 1 }, { unique: true })
       ]);
 
-      console.log('Created new indexes successfully');
+      logger.info('Created new indexes successfully');
     } catch (error) {
-      console.error('Error creating indexes:', error);
+      logger.error('Error creating indexes:', { error: error.message });
       throw error;
     }
   }
@@ -232,11 +302,11 @@ class MongoDBClient {
       await Promise.all(
         collections.map(collection => 
           collection.deleteMany({ timeframe: { $exists: false } })
-            .then(() => console.log(`Cleaned up old data from ${collection.collectionName}`))
+            .then(() => logger.info(`Cleaned up old data from ${collection.collectionName}`))
         )
       );
     } catch (error) {
-      console.error('Error cleaning up old data:', error);
+      logger.error('Error cleaning up old data:', { error: error.message });
     }
   }
 }
@@ -257,7 +327,7 @@ class GoogleGenAIClient {
 
   switchToNextModel() {
     this.currentIndex = (this.currentIndex + 1) % this.models.length;
-    console.log(`Switched to API key index: ${this.currentIndex}`);
+    logger.info(`Switched to API key index: ${this.currentIndex}`);
   }
 
   async fetchRealTimeNews(symbol, timeframe) {
@@ -289,7 +359,7 @@ class GoogleGenAIClient {
               throw new Error('Response is not an array');
             }
           } catch (parseError) {
-            console.error(`JSON parsing failed for ${symbol} (${timeframe}):`, parseError, 'Raw response:', jsonString);
+            logger.error(`JSON parsing failed for ${symbol} (${timeframe}):`, { error: parseError.message, raw: jsonString });
             throw new Error('Invalid JSON format in response');
           }
 
@@ -302,7 +372,7 @@ class GoogleGenAIClient {
                 ['high', 'medium', 'low'].includes(item.impact) &&
                 itemTime >= startTime && itemTime <= endTime;
               if (!isValid) {
-                console.warn(`Invalid news item for ${symbol} (${timeframe}):`, item);
+                logger.warn(`Invalid news item for ${symbol} (${timeframe}):`, { item });
               }
               return isValid;
             })
@@ -314,7 +384,7 @@ class GoogleGenAIClient {
         } catch (error) {
           lastError = error;
           if (error.message.includes('429') || error.message.includes('rate limit') || (error.response && error.response.status === 429)) {
-            console.log(`Rate limit hit on key ${this.currentIndex}, switching to next key`);
+            logger.warn(`Rate limit hit on key ${this.currentIndex}, switching to next key`);
             this.switchToNextModel();
           }
           if (attempt < MAX_RETRIES) {
@@ -324,7 +394,7 @@ class GoogleGenAIClient {
       }
       throw lastError || new Error('Failed to fetch news after retries');
     } catch (error) {
-      console.error(`Error fetching news for ${symbol} (${timeframe}):`, error);
+      logger.error(`Error fetching news for ${symbol} (${timeframe}):`, { error: error.message });
       return [{
         title: `No recent news for ${symbol}`,
         sentiment: 'neutral',
@@ -384,7 +454,7 @@ class GoogleGenAIClient {
               throw new Error('Incomplete analysis data');
             }
           } catch (parseError) {
-            console.error(`JSON parsing failed for ${symbol} (${timeframe}) analysis:`, parseError, 'Raw response:', jsonString);
+            logger.error(`JSON parsing failed for ${symbol} (${timeframe}) analysis:`, { error: parseError.message, raw: jsonString });
             throw new Error('Invalid JSON format in analysis response');
           }
 
@@ -392,7 +462,7 @@ class GoogleGenAIClient {
         } catch (error) {
           lastError = error;
           if (error.message.includes('429') || error.message.includes('rate limit') || (error.response && error.response.status === 429)) {
-            console.log(`Rate limit hit on key ${this.currentIndex}, switching to next key`);
+            logger.warn(`Rate limit hit on key ${this.currentIndex}, switching to next key`);
             this.switchToNextModel();
           }
           if (attempt < MAX_RETRIES) {
@@ -402,7 +472,7 @@ class GoogleGenAIClient {
       }
       throw lastError || new Error('Failed to fetch market analysis after retries');
     } catch (error) {
-      console.error(`Error fetching market analysis for ${symbol} (${timeframe}):`, error);
+      logger.error(`Error fetching market analysis for ${symbol} (${timeframe}):`, { error: error.message });
       return {
         marketImpact: `Unable to analyze market impact for ${symbol} due to data retrieval issues.`,
         tradingOpportunities: `No trading opportunities available due to insufficient data.`,
@@ -417,69 +487,165 @@ class GoogleGenAIClient {
 // Binance WebSocket client
 class BinanceWSClient {
   constructor() {
-    this.ws = new WebSocket(BINANCE_WS_URL);
+    this.ws = null;
     this.marketDataHistory = new Map();
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    this.isConnecting = false;
+    this.symbols = [
+      'btcusdt', 'ethusdt', 'bnbusdt', 'xrpusdt', 'solusdt',
+      'adausdt', 'dogeusdt', 'trxusdt', 'linkusdt', 'maticusdt',
+      'dotusdt', 'ltcusdt', 'bchusdt', 'avaxusdt', 'xlmusdt',
+      'uniusdt', 'atomusdt', 'etcusdt', 'filusdt', 'aptusdt',
+      'arbusdt', 'opusdt', 'nearusdt', 'injusdt', 'tiausdt'
+    ]; // 25 cryptocurrencies
     this.setupWebSocket();
   }
 
+  async backfill(symbol) {
+    const interval = '1m';
+    let startTime = Date.now() - DATA_WINDOW_MS;
+    const endTime = Date.now();
+    const history = [];
+    while (startTime < endTime) {
+      try {
+        const res = await axios.get('https://api.binance.com/api/v3/klines', {
+          params: {
+            symbol: symbol.toUpperCase(),
+            interval,
+            startTime,
+            limit: 1000
+          }
+        });
+        const klines = res.data;
+        if (klines.length === 0) break;
+        history.push(...klines.map(k => ({
+          open: parseFloat(k[1]),
+          high: parseFloat(k[2]),
+          low: parseFloat(k[3]),
+          close: parseFloat(k[4]),
+          volume: parseFloat(k[5]),
+          timestamp: k[6]
+        })));
+        startTime = klines[klines.length - 1][6] + 1;
+      } catch (e) {
+        logger.error(`Failed to backfill ${symbol}:`, { error: e.message });
+        break;
+      }
+    }
+    const sym = `${symbol.replace('usdt', '').toUpperCase()}/USDT`;
+    this.marketDataHistory.set(sym, history.sort((a, b) => a.timestamp - b.timestamp));
+  }
+
+  async waitForWebSocketOpen() {
+    const maxWaitTime = 10000; // 10 seconds max wait
+    const checkInterval = 100; // Check every 100ms
+    let elapsed = 0;
+
+    while (this.ws.readyState !== WebSocket.OPEN && elapsed < maxWaitTime) {
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+      elapsed += checkInterval;
+    }
+
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket failed to open within timeout');
+    }
+  }
+
   setupWebSocket() {
-    this.ws.on('open', () => {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
+    this.ws = new WebSocket(BINANCE_WS_URL);
+
+    this.ws.on('open', async () => {
       this.reconnectAttempts = 0;
-      const symbols = ['btcusdt', 'ethusdt', 'xrpusdt', 'bnbusdt', 'solusdt'];
-      symbols.forEach(symbol => {
-        this.ws.send(JSON.stringify({
-          method: 'SUBSCRIBE',
-          params: [`${symbol}@ticker`],
-          id: Date.now()
-        }));
-      });
+      this.isConnecting = false;
+      logger.info('WebSocket connected');
+
+      try {
+        // Backfill historical data for all symbols
+        for (const sym of this.symbols) {
+          await this.backfill(sym);
+        }
+
+        // Ensure WebSocket is open before sending subscriptions
+        await this.waitForWebSocketOpen();
+
+        // Subscribe to kline streams for all symbols
+        this.symbols.forEach(sym => {
+          try {
+            this.ws.send(JSON.stringify({
+              method: 'SUBSCRIBE',
+              params: [`${sym}@kline_1m`],
+              id: Date.now()
+            }));
+            logger.info(`Subscribed to ${sym}@kline_1m`);
+          } catch (error) {
+            logger.error(`Failed to subscribe to ${sym}:`, { error: error.message });
+          }
+        });
+      } catch (error) {
+        logger.error('Error during WebSocket subscription:', { error: error.message });
+        this.handleReconnect();
+      }
     });
 
     this.ws.on('message', (data) => {
-      const message = JSON.parse(data.toString());
-      if (message.e === '24hrTicker') {
-        this.updateMarketData(message);
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.e === 'kline') {
+          const kline = message.k;
+          if (kline.x) { // Only process closed candles
+            const symbol = `${message.s.split('USDT')[0]}/USDT`;
+            const marketData = {
+              open: parseFloat(kline.o),
+              high: parseFloat(kline.h),
+              low: parseFloat(kline.l),
+              close: parseFloat(kline.c),
+              volume: parseFloat(kline.v),
+              timestamp: kline.T
+            };
+            if (!this.marketDataHistory.has(symbol)) {
+              this.marketDataHistory.set(symbol, []);
+            }
+            const history = this.marketDataHistory.get(symbol);
+            if (!history.some(h => h.timestamp === marketData.timestamp)) {
+              history.push(marketData);
+            }
+            const cutoff = Date.now() - DATA_WINDOW_MS;
+            this.marketDataHistory.set(symbol, history.filter(d => d.timestamp >= cutoff));
+          }
+        }
+      } catch (error) {
+        logger.error('Error processing WebSocket message:', { error: error.message });
       }
     });
 
     this.ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+      logger.error('WebSocket error:', { error: error.message });
+      this.isConnecting = false;
+      this.handleReconnect();
     });
 
     this.ws.on('close', () => {
-      if (this.reconnectAttempts < this.maxReconnectAttempts) {
-        this.reconnectAttempts++;
-        setTimeout(() => {
-          this.ws = new WebSocket(BINANCE_WS_URL);
-          this.setupWebSocket();
-        }, RETRY_DELAY_MS * this.reconnectAttempts);
-      } else {
-        console.error('Max reconnect attempts reached. WebSocket connection failed.');
-      }
+      logger.info('WebSocket closed');
+      this.isConnecting = false;
+      this.handleReconnect();
     });
   }
 
-  updateMarketData(ticker) {
-    const symbol = `${ticker.s.split('USDT')[0]}/USD`;
-    const marketData = {
-      symbol,
-      price: parseFloat(ticker.c),
-      change: parseFloat(ticker.P),
-      volume: parseFloat(ticker.v),
-      category: 'crypto',
-      timestamp: Date.now()
-    };
-
-    if (!this.marketDataHistory.has(symbol)) {
-      this.marketDataHistory.set(symbol, []);
+  handleReconnect() {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      const delay = RETRY_DELAY_MS * this.reconnectAttempts; // Linear delay
+      logger.info(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${delay}ms`);
+      setTimeout(() => {
+        this.setupWebSocket();
+      }, delay);
+    } else {
+      logger.error('Max reconnect attempts reached. WebSocket connection failed.');
     }
-    const history = this.marketDataHistory.get(symbol);
-    history.push(marketData);
-
-    const cutoff = Date.now() - DATA_WINDOW_MS;
-    this.marketDataHistory.set(symbol, history.filter(data => data.timestamp >= cutoff));
   }
 
   getMarketData(symbol, timeframe) {
@@ -487,39 +653,39 @@ class BinanceWSClient {
     if (!history || history.length === 0) return undefined;
 
     const cutoff = Date.now() - TIMEFRAME_MS[timeframe];
-    const relevantData = history.filter(data => data.timestamp >= cutoff);
+    let relevantData = history.filter(data => data.timestamp >= cutoff);
 
     if (relevantData.length === 0) return undefined;
 
-    const avgPrice = relevantData.reduce((sum, data) => sum + data.price, 0) / relevantData.length;
-    const totalVolume = relevantData.reduce((sum, data) => sum + data.volume, 0);
-    const firstPrice = relevantData[0].price;
-    const lastPrice = relevantData[relevantData.length - 1].price;
-    const change = ((lastPrice - firstPrice) / firstPrice) * 100;
+    relevantData = relevantData.sort((a, b) => a.timestamp - b.timestamp);
+
+    const open = relevantData[0].open;
+    const high = Math.max(...relevantData.map(data => data.high));
+    const low = Math.min(...relevantData.map(data => data.low));
+    const close = relevantData[relevantData.length - 1].close;
+    const volume = relevantData.reduce((sum, data) => sum + data.volume, 0);
+    const change = open !== 0 ? ((close - open) / open) * 100 : 0;
 
     return {
       symbol,
-      price: avgPrice,
-      change,
-      volume: totalVolume,
+      open: Number(open.toFixed(2)),
+      high: Number(high.toFixed(2)),
+      low: Number(low.toFixed(2)),
+      close: Number(close.toFixed(2)),
+      change: Number(change.toFixed(2)),
+      volume: Number(volume.toFixed(2)),
       category: 'crypto',
       timestamp: Date.now()
     };
   }
 
   getCurrencyRate(symbol, timeframe) {
-    const history = this.marketDataHistory.get(symbol);
-    if (!history || history.length === 0) return undefined;
+    const marketData = this.getMarketData(symbol, timeframe);
+    if (!marketData) return undefined;
 
-    const cutoff = Date.now() - TIMEFRAME_MS[timeframe];
-    const relevantData = history.filter(data => data.timestamp >= cutoff);
-
-    if (relevantData.length === 0) return undefined;
-
-    const avgPrice = relevantData.reduce((sum, data) => sum + data.price, 0) / relevantData.length;
     return {
       symbol,
-      rate: Number(avgPrice.toFixed(2)),
+      rate: Number(marketData.close.toFixed(2)),
       timeframe,
       timestamp: Date.now()
     };
@@ -531,12 +697,11 @@ class MarketDataService {
   constructor() {
     this.genAIClient = new GoogleGenAIClient();
     this.binanceClient = new BinanceWSClient();
-    this.mongoClient = new MongoDBClient();
+    this.mongoClient = MongoDBClient.getInstance();
     this.initialize();
   }
 
   async initialize() {
-    await this.mongoClient.connect();
     await this.mongoClient.cleanupOldData();
     this.scheduleHourlyUpdates();
   }
@@ -552,7 +717,7 @@ class MarketDataService {
   }
 
   async updateCaches() {
-    console.log('Updating caches for hourly refresh');
+    logger.info('Updating caches for hourly refresh');
     const now = new Date();
     const symbols = await this.mongoClient.getAllCachedSymbols();
 
@@ -564,7 +729,10 @@ class MarketDataService {
           
           const cacheEntry = await this.mongoClient.getNewsCache(symbol, timeframe);
           let allNews = cacheEntry?.data || [];
-          allNews = [...allNews, ...newNews].filter(item => {
+          // Dedupe by title and timestamp
+          const existingKeys = new Set(allNews.map(n => `${n.title}|${n.timestamp}`));
+          const filteredNew = newNews.filter(n => !existingKeys.has(`${n.title}|${n.timestamp}`));
+          allNews = [...allNews, ...filteredNew].filter(item => {
             const itemTime = new Date(item.timestamp);
             return itemTime >= startTime && itemTime <= now;
           });
@@ -577,7 +745,7 @@ class MarketDataService {
             this.mongoClient.deleteMarketDataCache(symbol, timeframe)
           ]);
         } catch (error) {
-          console.error(`Error updating cache for ${symbol} (${timeframe}):`, error);
+          logger.error(`Error updating cache for ${symbol} (${timeframe}):`, { error: error.message });
         }
       }
     }
@@ -602,7 +770,7 @@ class MarketDataService {
   async getMarketBySymbol(symbol, timeframe) {
     const cacheEntry = await this.mongoClient.getMarketDataCache(symbol, timeframe);
     if (this.isCacheValid(cacheEntry)) {
-      console.log(`Cache hit for market data: ${symbol} (${timeframe})`);
+      logger.info(`Cache hit for market data: ${symbol} (${timeframe})`);
       return cacheEntry.data;
     }
 
@@ -616,10 +784,10 @@ class MarketDataService {
   async getCurrencyRate(symbol, timeframe) {
     const cacheEntry = await this.mongoClient.getMarketDataCache(symbol, timeframe);
     if (this.isCacheValid(cacheEntry)) {
-      console.log(`Cache hit for currency rate: ${symbol} (${timeframe})`);
+      logger.info(`Cache hit for currency rate: ${symbol} (${timeframe})`);
       return {
         symbol,
-        rate: Number(Number(cacheEntry.data.price).toFixed(2)),
+        rate: Number(Number(cacheEntry.data.close).toFixed(2)),
         timeframe,
         timestamp: cacheEntry.data.timestamp
       };
@@ -649,14 +817,14 @@ class MarketDataService {
     const cacheNeedsUpdate = latestTimestamp === 0 || (currentTime - latestTimestamp) > 10 * 60 * 1000;
   
     if (cacheNeedsUpdate) {
-      console.log(`Updating high-impact news cache for timeframe: ${timeframe}`);
+      logger.info(`Updating high-impact news cache for timeframe: ${timeframe}`);
       for (const symbol of symbols) {
         try {
           const news = await this.genAIClient.fetchRealTimeNews(symbol, timeframe);
   
           await this.mongoClient.setNewsCache(symbol, timeframe, news, currentTime);
         } catch (error) {
-          console.error(`Error updating news cache for ${symbol} (${timeframe}):`, error);
+          logger.error(`Error updating news cache for ${symbol} (${timeframe}):`, { error: error.message });
         }
       }
     }
@@ -729,13 +897,13 @@ class MarketDataService {
     const cutoffTime = new Date(now.getTime() - TIMEFRAME_MS[timeframe]);
 
     if (this.isCacheValid(cacheEntry)) {
-      console.log(`Cache hit for news: ${symbol} (${timeframe})`);
+      logger.info(`Cache hit for news: ${symbol} (${timeframe})`);
       return cacheEntry.data.filter(item => new Date(item.timestamp) >= cutoffTime);
     }
 
-    console.log(`Cache miss for news: ${symbol} (${timeframe}), fetching from API`);
+    logger.info(`Cache miss for news: ${symbol} (${timeframe}), fetching from API`);
     const news = await this.genAIClient.fetchRealTimeNews(symbol, timeframe);
-    console.log(`Fetched ${news.length} news items for ${symbol} (${timeframe})`);
+    logger.info(`Fetched ${news.length} news items for ${symbol} (${timeframe})`);
     await this.mongoClient.setNewsCache(symbol, timeframe, news, Date.now());
     return news;
   }
@@ -833,7 +1001,7 @@ class MarketDataService {
   async getMarketPsychology(symbol, timeframe) {
     const cacheEntry = await this.mongoClient.getPsychologyCache(symbol, timeframe);
     if (this.isCacheValid(cacheEntry)) {
-      console.log(`Cache hit for psychology: ${symbol} (${timeframe})`);
+      logger.info(`Cache hit for psychology: ${symbol} (${timeframe})`);
       return cacheEntry.data;
     }
 
@@ -911,25 +1079,25 @@ class MarketDataService {
 
     const fearGreedSum = psychology.fear + psychology.greed;
     if (Math.abs(fearGreedSum - 100) > 0.01) {
-      console.warn(`Fear/Greed sum for ${symbol} (${timeframe}) is ${fearGreedSum}. Normalizing...`);
+      logger.warn(`Fear/Greed sum for ${symbol} (${timeframe}) is ${fearGreedSum}. Normalizing...`);
       const factor = 100 / fearGreedSum;
       psychology.fear *= factor;
       psychology.greed *= factor;
     }
 
     await this.mongoClient.setPsychologyCache(symbol, timeframe, psychology, Date.now());
-    console.log(`Cached psychology for ${symbol} (${timeframe}):`, psychology);
+    logger.info(`Cached psychology for ${symbol} (${timeframe}):`, { psychology });
     return psychology;
   }
 
   async getMarketAnalysis(symbol, timeframe) {
     const cacheEntry = await this.mongoClient.getAnalysisCache(symbol, timeframe);
     if (this.isCacheValid(cacheEntry)) {
-      console.log(`Cache hit for analysis: ${symbol} (${timeframe})`);
+      logger.info(`Cache hit for analysis: ${symbol} (${timeframe})`);
       return cacheEntry.data;
     }
 
-    console.log(`Cache miss for analysis: ${symbol} (${timeframe}), fetching from API`);
+    logger.info(`Cache miss for analysis: ${symbol} (${timeframe}), fetching from API`);
     const [news, sentiment, market, psychology] = await Promise.all([
       this.getMarketNews(symbol, timeframe),
       this.getMarketSentiment(symbol, timeframe),
@@ -937,7 +1105,7 @@ class MarketDataService {
       this.getMarketPsychology(symbol, timeframe)
     ]);
     const analysis = await this.genAIClient.fetchMarketAnalysis(symbol, timeframe, news, sentiment, market, psychology);
-    console.log(`Fetched analysis for ${symbol} (${timeframe}):`, analysis);
+    logger.info(`Fetched analysis for ${symbol} (${timeframe}):`, { analysis });
     await this.mongoClient.setAnalysisCache(symbol, timeframe, analysis, Date.now());
     return analysis;
   }
@@ -955,9 +1123,6 @@ class MarketController {
   static getSymbol(req) {
     const base = req.params.base?.toUpperCase() || '';
     const quote = req.params.quote?.toUpperCase() || '';
-    if (!base || !quote) {
-      throw new Error('Missing base or quote in request params');
-    }
     return `${base}/${quote}`;
   }
 
@@ -967,7 +1132,7 @@ class MarketController {
       const markets = await MarketController.service.getAllMarkets(timeframe);
       res.json(markets);
     } catch (error) {
-      console.error('Error fetching all markets:', error);
+      logger.error('Error fetching all markets:', { error: error.message });
       res.status(500).json({ error: 'Failed to fetch markets' });
     }
   }
@@ -975,12 +1140,12 @@ class MarketController {
   static async getMarketBySymbol(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching market data for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching market data for symbol: ${symbol}, timeframe: ${timeframe}`);
       const market = await MarketController.service.getMarketBySymbol(symbol, timeframe);
-      market ? res.json(market) : res.status(404).json({ error: 'Market not found' });
+      return market ? res.json(market) : res.status(404).json({ error: 'Market not found' });
     } catch (error) {
-      console.error(`Error fetching market data for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching market data for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch market data' });
     }
   }
@@ -988,12 +1153,12 @@ class MarketController {
   static async getCurrencyRate(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching currency rate for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching currency rate for symbol: ${symbol}, timeframe: ${timeframe}`);
       const rateData = await MarketController.service.getCurrencyRate(symbol, timeframe);
-      rateData ? res.json(rateData) : res.status(404).json({ error: 'Currency rate not found' });
+      return rateData ? res.json(rateData) : res.status(404).json({ error: 'Currency rate not found' });
     } catch (error) {
-      console.error(`Error fetching currency rate for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching currency rate for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch currency rate' });
     }
   }
@@ -1001,12 +1166,12 @@ class MarketController {
   static async getTradingStrategies(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching trading strategies for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching trading strategies for symbol: ${symbol}, timeframe: ${timeframe}`);
       const strategies = await MarketController.service.getTradingStrategies(symbol, timeframe);
       res.json(strategies);
     } catch (error) {
-      console.error(`Error fetching trading strategies for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching trading strategies for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch trading strategies' });
     }
   }
@@ -1014,12 +1179,12 @@ class MarketController {
   static async getMarketNews(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching news for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching news for symbol: ${symbol}, timeframe: ${timeframe}`);
       const news = await MarketController.service.getMarketNews(symbol, timeframe);
       res.json(news);
     } catch (error) {
-      console.error(`Error fetching news for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching news for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch market news' });
     }
   }
@@ -1027,12 +1192,12 @@ class MarketController {
   static async getMarketSentiment(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching sentiment for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching sentiment for symbol: ${symbol}, timeframe: ${timeframe}`);
       const sentiment = await MarketController.service.getMarketSentiment(symbol, timeframe);
       res.json(sentiment);
     } catch (error) {
-      console.error(`Error fetching sentiment for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching sentiment for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch market sentiment' });
     }
   }
@@ -1040,12 +1205,12 @@ class MarketController {
   static async getMarketPsychology(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching psychology for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching psychology for symbol: ${symbol}, timeframe: ${timeframe}`);
       const psychology = await MarketController.service.getMarketPsychology(symbol, timeframe);
       res.json(psychology);
     } catch (error) {
-      console.error(`Error fetching psychology for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching psychology for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch market psychology' });
     }
   }
@@ -1053,12 +1218,12 @@ class MarketController {
   static async getMarketAnalysis(req, res) {
     try {
       const symbol = MarketController.getSymbol(req);
-      console.log(`Fetching analysis for symbol: ${symbol}, timeframe: ${MarketController.getTimeframe(req)}`);
       const timeframe = MarketController.getTimeframe(req);
+      logger.info(`Fetching analysis for symbol: ${symbol}, timeframe: ${timeframe}`);
       const analysis = await MarketController.service.getMarketAnalysis(symbol, timeframe);
       res.json(analysis);
     } catch (error) {
-      console.error(`Error fetching analysis for ${req.params.base}/${req.params.quote}:`, error);
+      logger.error(`Error fetching analysis for ${req.params.base}/${req.params.quote}:`, { error: error.message });
       res.status(500).json({ error: 'Failed to fetch market analysis' });
     }
   }
@@ -1066,15 +1231,11 @@ class MarketController {
   static async getAllImpactNews(req, res) {
     try {
       const timeframe = MarketController.getTimeframe(req);
-      console.log(`Fetching all high-impact news for today (timeframe: ${timeframe})`);
+      logger.info(`Fetching all high-impact news for today (timeframe: ${timeframe})`);
       const allImpactNews = await MarketController.service.getAllImpactNews(timeframe);
-      if (allImpactNews.length === 0) {
-        res.json([]);
-      } else {
-        res.json(allImpactNews);
-      }
+      res.json(allImpactNews);
     } catch (error) {
-      console.error('Error fetching all high-impact news for today:', error);
+      logger.error('Error fetching all high-impact news for today:', { error: error.message });
       res.status(500).json({ error: 'Failed to fetch high-impact news for today' });
     }
   }
@@ -1084,32 +1245,122 @@ class MarketController {
 const app = express();
 const PORT = process.env.PORT || 3005;
 
-// Load environment variables
-dotenv.config();
-
 // Middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      connectSrc: ["'self'", "api.binance.com", "api-m.sandbox.paypal.com"]
+    }
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/markets', limiter);
+app.use('/notifications', limiter);
 
 // JWT Authentication Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) {
-    res.status(401).json({ error: 'Authentication token missing' });
-    return;
+    return res.status(401).json({ error: 'Authentication token missing' });
   }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      res.status(403).json({ error: 'Invalid or expired token' });
-      return;
+      return res.status(403).json({ error: 'Invalid or expired token' });
     }
     req.user = user;
     next();
   });
 };
+
+// Subscription Access Middleware
+const checkSubscriptionAccess = async (req, res, next) => {
+  const { base, quote } = req.params;
+  const timeframe = MarketController.getTimeframe(req);
+  const symbol = `${base?.toUpperCase()}/${quote?.toUpperCase()}`;
+  const endpoint = req.path.split('/').pop(); // Get the last part of the path (e.g., 'news', 'sentiment')
+
+  // Get user subscription from DB
+  const mongoClient = MongoDBClient.getInstance();
+  const user = await mongoClient.getUserByEmail(req.user.email);
+  
+  // Free tier access check
+  const isFreeTier = !user?.subscription?.active || user?.subscription?.plan === 'Free';
+  if (isFreeTier) {
+    // Check if endpoint is allowed for free tier
+    if (!FREE_TIER_ACCESS.endpoints.includes(endpoint)) {
+      return res.status(403).json({ error: `Upgrade to access ${endpoint} endpoint` });
+    }
+    // Check if timeframe is allowed for free tier
+    if (!FREE_TIER_ACCESS.timeframes.includes(timeframe)) {
+      return res.status(403).json({ error: `Upgrade for ${timeframe} access` });
+    }
+    // Check if currency is allowed for free tier
+    if (!PLAN_CURRENCIES.Free.includes(symbol)) {
+      return res.status(403).json({ error: `Upgrade for ${symbol} access` });
+    }
+    req.userSubscription = { plan: 'Free', active: false };
+    return next();
+  }
+
+  // Paid tier checks
+  if (!user?.subscription?.active) {
+    return res.status(403).json({ error: 'Active subscription required' });
+  }
+  
+  // Check timeframe access for paid plans
+  const plan = user.subscription.plan;
+  const timeframeHours = parseInt(timeframe.replace('h', ''));
+  const hasTimeframeAccess = {
+    Basic: timeframeHours >= 12,
+    Pro: timeframeHours >= 6,
+    Enterprise: true
+  }[plan];
+  
+  if (!hasTimeframeAccess) {
+    return res.status(403).json({ error: `Upgrade for ${timeframe} access` });
+  }
+  
+  // Check currency access for paid plans
+  const allowedCurrencies = PLAN_CURRENCIES[plan];
+  if (allowedCurrencies !== 'all' && !allowedCurrencies.includes(symbol)) {
+    return res.status(403).json({ error: `Upgrade for ${symbol} access` });
+  }
+  
+  req.userSubscription = user.subscription;
+  next();
+};
+
+// Validation middleware factory
+const validateMarketRoute = [
+  param('base').isAlphanumeric().escape(),
+  param('quote').isAlphanumeric().escape(),
+  query('timeframe').optional().isIn(TIMEFRAMES),
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    next();
+  }
+];
 
 // Google OAuth2 Authentication
 app.post('/auth/google', async (req, res) => {
@@ -1126,27 +1377,155 @@ app.post('/auth/google', async (req, res) => {
       id: uuidv4(),
       name: payload.name || 'Unknown User',
       email: payload.email || '',
-      avatar: payload.picture || 'https://images.pexels.com/photos/614810/pexels-photo-614810.jpeg?auto=compress&cs=tinysrgb&w=100&h=100&dpr=2'
+      avatar: payload.picture || 'https://images.pexels.com/photos/614810/pexels-photo-614810.jpeg?auto=compress&cs=tinysrgb&w=100&h=100&dpr=2',
+      availableBalance: 0,
+      totalWithdrawn: 0,
+      pendingWithdrawals: 0,
+      subscription: {
+        plan: 'Free',
+        subscriptionId: null,
+        startDate: null,
+        active: false
+      }
     };
 
-    const mongoClient = new MongoDBClient();
-    await mongoClient.connect();
+    const mongoClient = MongoDBClient.getInstance();
     await mongoClient.createOrUpdateUser(user);
 
     const jwtToken = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ success: true, user, token: jwtToken });
   } catch (error) {
-    console.error('Google login failed:', error);
+    logger.error('Google login failed:', { error: error.message });
     res.status(401).json({ success: false, message: 'Invalid token' });
   }
 });
 
+// Subscription Route
+/* ==========  PAYPAL $49 SUBSCRIPTION BACKEND  ========== */
+
+const basicAuth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
+
+async function paypalRequest(path, method = 'GET', data = null) {
+  const token = await getPayPalAccessToken();
+  return axios({
+    url: `${process.env.PAYPAL_API_BASE}${path}`,
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    data
+  });
+}
+
+async function getPayPalAccessToken() {
+  const { data } = await axios({
+    url: `${process.env.PAYPAL_API_BASE}/v1/oauth2/token`,
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Accept-Language': 'en_US',
+      Authorization: `Basic ${basicAuth}`
+    },
+    params: { grant_type: 'client_credentials' }
+  });
+  return data.access_token;
+}
+
+/* ---- 1.  create $49 plan (run ONCE manually) ---- */
+app.post('/create-plan', async (_req, res) => {
+  if (process.env.PAYPAL_PLAN_ID) return res.json({ planId: process.env.PAYPAL_PLAN_ID });
+
+  try {
+    const payload = {
+      product_id: 'PROD-PREMIUM-MONTHLY',   // you can create a product first if you want
+      name: 'Premium Monthly',
+      description: '$49 USD every month',
+      billing_cycles: [{
+        frequency: { interval_unit: 'MONTH', interval_count: 1 },
+        tenure_type: 'REGULAR',
+        sequence: 1,
+        total_cycles: 0,
+        pricing_scheme: { fixed_price: { currency_code: 'USD', value: '49.00' } }
+      }],
+      payment_preferences: {
+        auto_bill_outstanding: true,
+        setup_fee_failure_action: 'CANCEL',
+        payment_failure_threshold: 3
+      }
+    };
+    const { data } = await paypalRequest('/v1/billing/plans', 'POST', payload);
+    // persist it so we never create duplicates
+    require('fs').appendFileSync('.env', `\nPAYPAL_PLAN_ID=${data.id}\n`);
+    process.env.PAYPAL_PLAN_ID = data.id;
+    res.json({ planId: data.id });
+  } catch (e) {
+    logger.error('Plan creation failed:', e.response?.data || e.message);
+    res.status(500).json({ error: 'Plan creation failed' });
+  }
+});
+
+/* ---- 2.  create subscription for customer ---- */
+app.post('/subscribe', authenticateToken, async (req, res) => {
+  const { plan, return_url, cancel_url } = req.body;   // plan is "Basic" (==$49)
+  if (!plan || !return_url || !cancel_url) {
+    return res.status(400).json({ error: 'plan, return_url and cancel_url required' });
+  }
+  const PLAN_ID = process.env.PAYPAL_PLAN_ID;
+  if (!PLAN_ID) return res.status(500).json({ error: 'PayPal plan not initialised' });
+
+  try {
+    const mongo = MongoDBClient.getInstance();
+    const user = await mongo.getUserByEmail(req.user.email);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { data } = await paypalRequest('/v1/billing/subscriptions', 'POST', {
+      plan_id: PLAN_ID,
+      subscriber: { email_address: req.user.email, name: { given_name: user.name } },
+      application_context: {
+        brand_name: 'YourSite',
+        return_url,
+        cancel_url
+      }
+    });
+
+    // front-end redirects buyer to approval link
+    const approvalLink = data.links.find(l => l.rel === 'approve').href;
+    res.json({ subscriptionId: data.id, approvalLink });
+  } catch (e) {
+    logger.error('Subscription creation failed:', e.response?.data || e.message);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+/* ---- 3.  webhook: activate user after first payment ---- */
+app.post('/webhook', bodyParser.raw({ type: 'application/json' }), (req, res) => {
+  const sig = req.headers['paypal-transmission-sig'];
+  const ts  = req.headers['paypal-transmission-time'];
+  const tx  = req.headers['paypal-transmission-id'];
+  const expected = require('crypto')
+    .createHash('sha256')
+    .update(`${tx}|${process.env.WEBHOOK_SECRET}|${ts}|${req.body.toString()}`)
+    .digest('hex');
+  if (sig !== expected) return res.status(400).send('Bad signature');
+
+  const event = JSON.parse(req.body);
+  if (event.event_type === 'BILLING.SUBSCRIPTION.ACTIVATED') {
+    const subId = event.resource.id;
+    const mongo = MongoDBClient.getInstance();
+    mongo.usersCollection.updateOne(
+      { 'subscription.subscriptionId': subId },
+      { $set: { 'subscription.active': true, 'subscription.plan': 'Basic' } }
+    ).then(() => logger.info(`✅ User activated for sub ${subId}`));
+  }
+  res.status(200).send('OK');
+});
+/* ========================================================= */
 // User Profile Route
 app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
     const userEmail = req.user.email;
-    const mongoClient = new MongoDBClient();
-    await mongoClient.connect();
+    const mongoClient = MongoDBClient.getInstance();
     const user = await mongoClient.getUserByEmail(userEmail);
     if (user) {
       res.json(user);
@@ -1154,35 +1533,94 @@ app.get('/api/profile', authenticateToken, async (req, res) => {
       res.status(404).json({ error: 'User not found' });
     }
   } catch (error) {
-    console.error('Error fetching profile:', error);
+    logger.error('Error fetching profile:', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch profile' });
   }
 });
 
+// Health Checks
+app.get('/health', async (req, res) => {
+  try {
+    await MongoDBClient.getInstance().client.db(DB_NAME).admin().ping();
+    res.json({ 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    });
+  } catch (error) {
+    logger.error('Health check failed:', { error: error.message });
+    res.status(503).json({ status: 'unhealthy', error: error.message });
+  }
+});
+
+app.get('/ready', (req, res) => {
+  res.json({ status: 'ready' });
+});
+
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+  res.json({
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    requests: global.requestCount || 0,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Track requests
+app.use((req, res, next) => {
+  global.requestCount = (global.requestCount || 0) + 1;
+  next();
+});
+
 // Market Data Routes
 app.get('/markets', MarketController.getAllMarkets);
-app.get('/markets/:base/:quote', MarketController.getMarketBySymbol);
-app.get('/markets/:base/:quote/rate', MarketController.getCurrencyRate);
-app.get('/markets/:base/:quote/strategies', MarketController.getTradingStrategies);
-app.get('/markets/:base/:quote/news', MarketController.getMarketNews);
-app.get('/markets/:base/:quote/sentiment', MarketController.getMarketSentiment);
-app.get('/markets/:base/:quote/psychology', MarketController.getMarketPsychology);
-app.get('/markets/:base/:quote/analysis', MarketController.getMarketAnalysis);
-app.get('/notifications/all-impact-news', MarketController.getAllImpactNews);
+app.get('/markets/:base/:quote', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getMarketBySymbol);
+app.get('/markets/:base/:quote/rate', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getCurrencyRate);
+app.get('/markets/:base/:quote/strategies', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getTradingStrategies);
+app.get('/markets/:base/:quote/news', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getMarketNews);
+app.get('/markets/:base/:quote/sentiment', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getMarketSentiment);
+app.get('/markets/:base/:quote/psychology', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getMarketPsychology);
+app.get('/markets/:base/:quote/analysis', validateMarketRoute, authenticateToken, checkSubscriptionAccess, MarketController.getMarketAnalysis);
+app.get('/notifications/all-impact-news', authenticateToken, MarketController.getAllImpactNews);
 
 // Error handling middleware
-app.use((err, _req, res) => {
-  console.error(err.stack);
+app.use((err, req, res, next) => {
+  logger.error('Unhandled error:', { error: err.stack, path: req.path });
   res.status(500).json({ error: 'Something went wrong!' });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+const server = app.listen(PORT, () => {
+  logger.info(`Server is running on port ${PORT} in ${NODE_ENV} mode`);
 });
+
+// Graceful shutdown
+const gracefulShutdown = async () => {
+  logger.info('Shutting down gracefully');
+  try {
+    if (mongoInstance) {
+      await mongoInstance.client.close();
+      logger.info('MongoDB connection closed');
+    }
+    if (MarketController.service.binanceClient.ws) {
+      MarketController.service.binanceClient.ws.close();
+      logger.info('Binance WebSocket closed');
+    }
+    server.close(() => {
+      logger.info('HTTP server closed');
+      process.exit(0);
+    });
+  } catch (error) {
+    logger.error('Error during shutdown:', { error: error.message });
+    process.exit(1);
+  }
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
+  logger.error('Unhandled Rejection at:', { promise, reason });
 });
