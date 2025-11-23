@@ -1,6 +1,0 @@
-{
-  "build": {
-    "builder": "paketo"   
-  },
-  "start": "node server.js"   
-}
